@@ -68,11 +68,29 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - pods
+  - services
   verbs:
   - get
   - list
   - watch
+  - update
+  - patch
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - services/status
+  verbs:
+  - get
+  - update
+  - patch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -194,7 +212,7 @@ spec:
         - --health-probe-bind-address=:8081
         command:
         - /manager
-        image: controller:latest
+        image: jasonhao123/loadbalancer-operator:v1
         livenessProbe:
           httpGet:
             path: /healthz

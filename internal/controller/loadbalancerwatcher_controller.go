@@ -1,7 +1,9 @@
 package controller
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -13,6 +15,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
+type Payload struct {
+	Namespace      string `json:"namespace"`
+	Name  string `json:"name"`
+	Ports    []corev1.ServicePort `json:"ports"`
+}
+
 // LoadBalancerWatcherReconciler reconciles a LoadBalancerWatcher object
 type LoadBalancerWatcherReconciler struct {
 	client.Client
@@ -23,18 +31,41 @@ type LoadBalancerWatcherReconciler struct {
 func (r *LoadBalancerWatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
+	// get cluster id from current node label cluster-id
+	clusterID := ""
+	nodeList := &corev1.NodeList{}
+	if err := r.List(ctx, nodeList); err != nil {
+		return ctrl.Result{}, err
+	}
+	
+	for _, node := range nodeList.Items {
+		if _, ok := node.Labels["node-role.kubernetes.io/master"]; ok {
+			if val, ok := node.Labels["cluster-id"]; ok {
+				clusterID = val
+				break
+			}
+		}
+	}
+	token, err := GetServiceAccountToken()
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to get service account token: %v", err)
+	}
+	if token == "" {
+		return ctrl.Result{}, fmt.Errorf("service account token is empty")
+	}
+
 	var svc corev1.Service
-	err := r.Get(ctx, req.NamespacedName, &svc)
+	err = r.Get(ctx, req.NamespacedName, &svc)
 
 	// 🛑 Case 1: Service was deleted
 	if err != nil {
 		log.Info("Service deleted, deallocating IP", "name", req.Name)
-		go notifyIPDeallocation(req.Name) // Notify API asynchronously
+		go notifyIPDeallocation(clusterID, token, req.Namespace, req.Name) // Notify API asynchronously
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
 	// 🛑 Case 2: Ignore if not LoadBalancer type
-	if svc.Spec.Type != corev1.ServiceTypeLoadBalancer {
+	if svc.Spec.Type != corev1.ServiceTypeLoadBalancer || svc.Namespace == "kube-system" {
 		return ctrl.Result{}, nil
 	}
 
@@ -43,8 +74,13 @@ func (r *LoadBalancerWatcherReconciler) Reconcile(ctx context.Context, req ctrl.
 		return ctrl.Result{}, nil
 	}
 
+	data := Payload{
+		Namespace:      svc.Namespace,
+		Name:    svc.Name,
+		Ports:   svc.Spec.Ports,
+	}
 	// ✅ Case 4: Assign a new IP
-	publicIP, err := getPublicIPFromAPI()
+	publicIP, err := getPublicIPFromAPI(clusterID, token, data)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -53,8 +89,9 @@ func (r *LoadBalancerWatcherReconciler) Reconcile(ctx context.Context, req ctrl.
 
 	// Patch the service with the new IP
 	patch := client.MergeFrom(svc.DeepCopy())
-	svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: publicIP}}
-	if err := r.Status().Patch(ctx, &svc, patch); err != nil {
+	svc.Spec.ExternalIPs = []string{publicIP}
+	//svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: publicIP}}
+	if err := r.Client.Patch(ctx, &svc, patch); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -62,30 +99,73 @@ func (r *LoadBalancerWatcherReconciler) Reconcile(ctx context.Context, req ctrl.
 }
 
 // getPublicIPFromAPI calls an external API to fetch a new IP
-func getPublicIPFromAPI() (string, error) {
-	resp, err := http.Get("https://my-api.com/get-public-ip") // Replace with your actual API
-	if err != nil {
-		return "", fmt.Errorf("error calling API: %v", err)
-	}
-	defer resp.Body.Close()
+func getPublicIPFromAPI(cluster string, token string, data Payload) (string, error) {
+    url := fmt.Sprintf("https://k3sphere.com/api/cluster/%s/service", cluster) // Replace with your actual API
 
-	body, err := ioutil.ReadAll(resp.Body)
+
+	// Marshal the data to JSON
+	jsonData, err := json.Marshal(data)
 	if err != nil {
-		return "", fmt.Errorf("error reading API response: %v", err)
+		fmt.Println("Error marshaling JSON:", err)
 	}
 
-	return string(body), nil
+	// Create a new HTTP POST request
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+    if err != nil {
+        return "", fmt.Errorf("error creating request: %v", err)
+    }
+
+    // Set the authorization header
+    req.Header.Set("Authorization", "Bearer "+token)
+
+    client := &http.Client{}
+    resp, err := client.Do(req)
+    if err != nil {
+        return "", fmt.Errorf("error calling API: %v", err)
+    }
+    defer resp.Body.Close()
+
+    body, err := ioutil.ReadAll(resp.Body)
+    if err != nil {
+        return "", fmt.Errorf("error reading API response: %v", err)
+    }
+
+    var responseData struct {
+        IP string `json:"ip"`
+    }
+    if err := json.Unmarshal(body, &responseData); err != nil {
+        return "", fmt.Errorf("error decoding response: %v", err)
+    }
+
+    return responseData.IP, nil
 }
 
 // notifyIPDeallocation calls an external API when a service is deleted
-func notifyIPDeallocation(serviceName string) {
-	apiURL := fmt.Sprintf("https://my-api.com/release-ip?service=%s", serviceName)
-	_, err := http.Post(apiURL, "application/json", nil)
-	if err != nil {
-		fmt.Printf("Failed to notify IP deallocation for %s: %v\n", serviceName, err)
-	} else {
-		fmt.Printf("IP deallocation notified for service %s\n", serviceName)
+func notifyIPDeallocation(cluster string, token string, namespace string, serviceName string) {
+    url := fmt.Sprintf("https://k3sphere.com/api/cluster/%s/service/%s-%s", cluster,namespace, serviceName) // Replace with your actual API
+    req, err := http.NewRequest("DELETE", url, nil)
+    if err != nil {
+        fmt.Printf("error creating request: %v", err)
+		return
+    }
+
+    // Set the authorization header
+    req.Header.Set("Authorization", "Bearer "+token)
+
+    client := &http.Client{}
+    resp, err := client.Do(req)
+    if err != nil {
+		fmt.Printf("error call api request: %v", err)
+		return
+    }
+    defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		fmt.Printf("error response status code: %d", resp.StatusCode)
+		return
 	}
+
+
 }
 
 // SetupWithManager registers the controller with the Manager
@@ -93,4 +173,16 @@ func (r *LoadBalancerWatcherReconciler) SetupWithManager(mgr ctrl.Manager) error
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.Service{}). // Watch Service resources
 		Complete(r)
+}
+
+
+// GetServiceAccountToken reads the token from the mounted service account secret
+func GetServiceAccountToken() (string, error) {
+	const tokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+	
+	token, err := ioutil.ReadFile(tokenPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read service account token: %w", err)
+	}
+	return string(token), nil
 }
