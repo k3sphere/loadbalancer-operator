@@ -89,7 +89,7 @@ func (r *LoadBalancerWatcherReconciler) Reconcile(ctx context.Context, req ctrl.
 
 	// Patch the service with the new IP
 	patch := client.MergeFrom(svc.DeepCopy())
-	svc.Spec.ExternalIPs = []string{publicIP}
+	svc.Spec.ExternalIPs = publicIP
 	//svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: publicIP}}
 	if err := r.Client.Patch(ctx, &svc, patch); err != nil {
 		return ctrl.Result{}, err
@@ -99,7 +99,7 @@ func (r *LoadBalancerWatcherReconciler) Reconcile(ctx context.Context, req ctrl.
 }
 
 // getPublicIPFromAPI calls an external API to fetch a new IP
-func getPublicIPFromAPI(cluster string, token string, data Payload) (string, error) {
+func getPublicIPFromAPI(cluster string, token string, data Payload) ([]string, error) {
     url := fmt.Sprintf("https://k3sphere.com/api/cluster/%s/service", cluster) // Replace with your actual API
 
 
@@ -112,7 +112,7 @@ func getPublicIPFromAPI(cluster string, token string, data Payload) (string, err
 	// Create a new HTTP POST request
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
     if err != nil {
-        return "", fmt.Errorf("error creating request: %v", err)
+        return []string{}, fmt.Errorf("error creating request: %v", err)
     }
 
     // Set the authorization header
@@ -121,20 +121,20 @@ func getPublicIPFromAPI(cluster string, token string, data Payload) (string, err
     client := &http.Client{}
     resp, err := client.Do(req)
     if err != nil {
-        return "", fmt.Errorf("error calling API: %v", err)
+        return []string{}, fmt.Errorf("error calling API: %v", err)
     }
     defer resp.Body.Close()
 
     body, err := ioutil.ReadAll(resp.Body)
     if err != nil {
-        return "", fmt.Errorf("error reading API response: %v", err)
+        return []string{}, fmt.Errorf("error reading API response: %v", err)
     }
 
     var responseData struct {
-        IP string `json:"ip"`
+        IP []string `json:"ip"`
     }
     if err := json.Unmarshal(body, &responseData); err != nil {
-        return "", fmt.Errorf("error decoding response: %v", err)
+        return []string{}, fmt.Errorf("error decoding response: %v", err)
     }
 
     return responseData.IP, nil
@@ -142,7 +142,7 @@ func getPublicIPFromAPI(cluster string, token string, data Payload) (string, err
 
 // notifyIPDeallocation calls an external API when a service is deleted
 func notifyIPDeallocation(cluster string, token string, namespace string, serviceName string) {
-    url := fmt.Sprintf("https://k3sphere.com/api/cluster/%s/service/%s-%s", cluster,namespace, serviceName) // Replace with your actual API
+    url := fmt.Sprintf("https://k3sphere.com/api/cluster/%s/service/%s:%s", cluster,namespace, serviceName) // Replace with your actual API
     req, err := http.NewRequest("DELETE", url, nil)
     if err != nil {
         fmt.Printf("error creating request: %v", err)
